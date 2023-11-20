@@ -1,4 +1,4 @@
-# 三次握手中的客户端connect异常
+# 三次握手中的客户端connect异常查找
 
 在 TCP 连接中，客户端在发起连接请求前会先确定一个客户端端口，然后用这个端口去和服务器端进行握手建立连接。客户端在发起 connect 系统调用的时候，主要工作就是端口选择。确切来说是端口选择的异常
 
@@ -349,285 +349,456 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 
 
 
-tcp_connect_time.bpf.c
+
+
+
+
+本周工作：
+
+1.完成了三次握手中的丢包异常
+
+2.论文：Design and implementation of an intrusion detection system by using Extended BPF in the Linux kernel
+
+入侵检测系统的设计与实现Linux 内核中的扩展 BPF
+
+3.学习了《深入理解Linux网络》第二章内核如何接收网络包
+
+
+
+# 三次握手中的丢包异常
+
+##### 客户端第一个【SYN】包丢了
+
+1、如果在TCP连接中，客户端的第一个【SYN】包丢了，而此时跟服务器端并无联系，所以处理办法在客户端。
+2、在TCP协议中，任何一端的【请求——应答】过程中，在一定时间范围内没有接收到对方的回应的【ACK】包，就会认为是丢包，此时触发超时重传机制。
+3、此时会重传【SYN】包，会重传3次，时间间隔分别是： 5.8s、24s、48s，三次时间大约是 76s 左右，而大多数伯克利系统将建立一个新连接的最长时间，限制为 75s。
+
+##### 服务器端收到【SYN】回复，但是回复的【SYN，ACK】包丢了
+
+1、对于客户端来说，在规定时间内没有接收到来自服务器端的回复，会认为是自己丢包了，会进行重传【SYN】包。
+2、对于服务器端来说，发出的【SYN，SCK】迟迟没有客户端的【ACK】回复，会触发重传，此时服务端处于 SYN_RCVD 状态，会依次等待 3s、6s、12s 后，重新发送【SYN，ACK】包；而【SYN，ACK】的重传次数，不同操作系统有不同的配置，例如在 Linux 下可以通过 tcp_synack_retries 进行配置，默认值为 5。如果这个重试次数内，仍未收到【ACK】应答包，那么服务端会自动关闭这个连接。
+3、同时由于客户端在没有收到【SYN，ACK】时，也会进行重传，当客户端重传的【SYN】收到后，会立即重新发送【SYN，ACK】包。
+
+##### 客户端收到【SYN，ACK】包，在回复时丢失【ACK】包
+
+1、对于客户端，在发送【ACK】包后进入 ESTABLISHED 状态。多数情况下，客户端进入ESTABLISHED 状态后，认为连接已建立，会立即发送数据。
+2、对于服务端，因为没有收到【ACK】会走**重传机制**，但是服务端因为没有收到最后一个【ACK】包，依然处于 SYN-RCVD 状态。
+3、当服务端处于 SYN-RCVD 状态下时，接收到客户端真实发送来的数据包时，会认为连接已建立，并进入ESTABLISHED状态。
+原因：
+当客户端在 ESTABLISHED 状态下，开始发送数据包时，会携带上一个【ACK】的确认序号，所以哪怕客户端响应的【ACK】包丢了，服务端在收到这个数据包时，能够通过包内 ACK 的确认序号，正常进入 ESTABLISHED 状态。
+
+## 第一次握手丢包
+
+服务器在响应来自客户端的第一次握手请求的时候，会判断一下**半连接队列和全连接队列**是否溢出。如果发生溢出，可能会直接将握手包丢弃，而不会反馈给客户端。
+
+#### 半连接队列满
 
 ```
-#include "vmlinux.h"
-
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
-
-#include "tcp_connect_time.h"
-
-char LICENSE[] SEC("license") = "Dual BSD/GPL";
-
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 10800);
-	__type(key, u32);
-	__type(value, struct delay);
-} start SEC(".maps");
-
-
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 256 * 1024);
-} rb SEC(".maps");
-
-
-
-SEC("kprobe/inet_hash_connect")
-int BPF_KPROBE(inet_hash_connect, struct sock* sk){
-
-	u32 pid = bpf_get_current_pid_tgid();
-	u64 exec = bpf_ktime_get_ns()/1000;	
-
-	struct delay data = {};
-	data.pid = pid;
-	data.exec = exec;
-	data.exit = 0;
-	data.delay = 0;
-    bpf_map_update_elem(&start, &pid, &data, BPF_ANY);
-
-	return 0;
-}
-
-
-SEC("kretprobe/inet_hash_connect")
-int BPF_KRETPROBE(inet_hash_connect_exit, struct sock* sk){
-
-	u32 pid = bpf_get_current_pid_tgid();
-	u64 exit = bpf_ktime_get_ns()/1000;
-
-	struct delay *delay_exec = bpf_map_lookup_elem(&start, &pid);
-	if (delay_exec == 0) 
-	{
-		return 0;
-	}
-
-	u64 delay = exit - delay_exec->exec;
-	
-	struct delay data = {};
-	
-	data.pid = pid;
-	data.exec = delay_exec->exec;
-	data.exit = exit;
-	data.delay = delay;
-	
-	bpf_map_update_elem(&start, &pid, &data, BPF_ANY);
-	
-	return 0;
-}
-
-SEC("kprobe/tcp_connect")
-int BPF_KPROBE(tcp_connect, struct sock* sk){
-    u32 pid = bpf_get_current_pid_tgid();
-
-
-	struct delay *delay;
-	delay = bpf_map_lookup_elem(&start, &pid);
-	if(!delay) {
-		return 0;
-	}
-    
-    u16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
-    u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-    u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-    u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);
-
-
-    struct ip_data *data;
-    data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
-    if(!data){
-        return 0;
-    }
-
-
-    data->pid = pid;
-	data->exec = delay->exec;
-	data->exit = delay->exit;
-	data->delay = delay->delay;
-    data->saddr = saddr;
-    data->daddr = daddr;
-    data->dport = dport;
-    data->sport = sport;
-
-    bpf_ringbuf_submit(data, 0);
-
-
-    return 0;
-}
-```
-
-tcp_connect_time.c
-
-```
-#include <argp.h>
-#include <signal.h>
-#include <stdio.h>
-#include <time.h>
-#include <sys/resource.h>
-#include <bpf/libbpf.h>
-#include <arpa/inet.h>
-
-
-#include "tcp_connect_time.h"
-#include "tcp_connect_time.skel.h"
-
-
-static volatile bool exiting = false;
-
-static void sig_handler(int sig)
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 {
-	exiting = true;
-}
+ //看看半连接队列是否满了
+ if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
+  want_cookie = tcp_syn_flood_action(sk, skb, "TCP");
+  if (!want_cookie)
+   goto drop;
+ }
 
-
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
-{
-	if (level == LIBBPF_DEBUG )
-		return 0;
-	return vfprintf(stderr, format, args);
-}
-
-static int handle_event(void *ctx, void *data, size_t data_sz)
-{
-    const struct ip_data *d = data;
-    char s_str[INET_ADDRSTRLEN];
-	char d_str[INET_ADDRSTRLEN];
-
-    struct in_addr src;
-	struct in_addr dst;
-	char s_ipv4_port_str[INET_ADDRSTRLEN+6];
-	char d_ipv4_port_str[INET_ADDRSTRLEN+6];
-
-	src.s_addr = d->saddr;
-	dst.s_addr = d->daddr;
-	sprintf(s_ipv4_port_str,"%s:%d",inet_ntop(AF_INET, &src, s_str, sizeof(s_str)),d->sport);
-	sprintf(d_ipv4_port_str,"%s:%d",inet_ntop(AF_INET, &dst, d_str, sizeof(d_str)),d->dport);
-	printf("%-22s %-22s %-11d %-11llu %-11llu %-11d\n",
-		s_ipv4_port_str,
-		d_ipv4_port_str,
-		d->pid,
-		d->exec,
-		d->exit,
-		d->delay
-	);
-
-
-    return 0;
-}
-
-int main(int argc, char **argv)
-{
-	struct ring_buffer *rb = NULL;
-	struct tcp_connect_time_bpf *skel;
-	int err = 0;
-
-    
-
-    libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
-	/* Set up libbpf errors and debug info callback */
-	libbpf_set_print(libbpf_print_fn);
-
-	/* Cleaner handling of Ctrl-C */
-	signal(SIGINT, sig_handler);
-	signal(SIGTERM, sig_handler);
-
-	/* Load and verify BPF application */
-	skel = tcp_connect_time_bpf__open();
-	if (!skel) {
-		fprintf(stderr, "Failed to open and load BPF skeleton\n");
-		return 1;
-	}
-
-    /* Load & verify BPF programs */
-	err = tcp_connect_time_bpf__load(skel);
-	if (err) {
-		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
-		goto cleanup;
-	}
-
-    /* Attach tracepoints */
-	err = tcp_connect_time_bpf__attach(skel);
-	if (err) {
-		fprintf(stderr, "Failed to attach BPF skeleton\n");
-		goto cleanup;
-	}
-
-	/* Set up ring buffer polling */
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
-	if (!rb) {
-		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
-		goto cleanup;
-	}
-
-	/* Process events */
-
-	
-	printf("%-22s %-22s %-11s %-11s %-11s %-11s \n",
-        "SADDR:SPORT", "DADDR:DPORT", "PID", "EXEC", "EXIT", "DElAY");
-	
-
-	while (!exiting) {
-		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
-		/* Ctrl-C will cause -EINTR */
-		if (err == -EINTR) {
-			err = 0;
-			break;
-		}
-		if (err < 0) {
-			printf("Error polling perf buffer: %d\n", err);
-			break;
-		}
-	
-	}
-
-cleanup:
-	/* Clean up */
-	ring_buffer__free(rb);
-	tcp_connect_time_bpf__destroy(skel);
-
-	return err < 0 ? -err : 0;
+ //看看全连接队列是否满了
+ ...
+drop:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+ return 0; 
 }
 ```
 
-tcp_connect_time.h
+inet_csk_reqsk_queue_is_full 如果返回 true 就表示半连接队列满了，另外 tcp_syn_flood_action 判断是否打开了内核参数 tcp_syncookies，如果未打开则返回 false。
 
 ```
-#ifndef __TCP_CONNECT_TIME_H
-#define __TCP_CONNECT_TIME_H
+//file: net/ipv4/tcp_ipv4.c
+bool tcp_syn_flood_action(...)
+{
+ bool want_cookie = false;
 
-#define u8 unsigned char
-#define u16 unsigned short
-#define u32 unsigned int
-#define u64 unsigned long long
-
-
-struct delay {
-	u32 pid;
-	u64 exec;
-	u64 exit;
-	u32 delay;
-};
-
-struct ip_data {
-	u32 pid;
-	u64 exec;
-	u64 exit;
-	u32 delay;
-	u32 saddr;
-    u32 daddr;
-    u16 sport;
-    u16 dport;
-};
-
-
-#endif
+ if (sysctl_tcp_syncookies) {
+  want_cookie = true;
+ } 
+ return want_cookie;
+}
 ```
+
+**如果半连接队列满了，而且 ipv4.tcp_syncookies 参数设置为 0，那么来自客户端的握手包将 goto drop，意思就是直接丢弃！**
+
+### 全连接队列满
+
+当半连接队列判断通过以后，紧接着还有全连接队列满的相关判断。如果这个条件成立，服务器对握手包的处理还是会 goto drop，丢弃了之。
+
+```
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+ //看看半连接队列是否满了
+ ...
+
+ //看看全连接队列是否满了
+ if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
+  NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+  goto drop;
+ }
+ ...
+drop:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+ return 0; 
+}
+```
+
+sk_acceptq_is_full 来判断全连接队列是否满了，inet_csk_reqsk_queue_young 判断的是有没有 young_ack（未处理完的半连接请求）。
+
+这段代码可以看到，**假如全连接队列满的情况下，且同时有 young_ack ，那么内核同样直接丢掉该 SYN 握手包**。
+
+##### TCP 第一次握手（收到 SYN 包）时会被丢弃的三种条件：
+
+1. 如果半连接队列满了，并且没有开启 tcp_syncookies，则会丢弃；
+2. 若全连接队列满了，且没有重传 SYN+ACK 包的连接请求多于 1 个，则会丢弃；
+3. **如果没有开启 tcp_syncookies，并且 max_syn_backlog 减去 当前半连接队列长度小于 (max_syn_backlog >> 2)，则会丢弃；**
+
+### 客户端发起重试
+
+如果服务器侧发生了全/半连接队列溢出而导致的丢包。那么从转换到客户端视角来看就是 SYN 包没有任何响应。
+
+客户端在发出握手包的时候，开启了一个重传定时器。如果收不到预期的 syn+ack 的话，超时重传的逻辑就会开始执行。不过重传计时器的时间单位都是以秒来计算的，这意味着，如果有握手重传发生，即使第一次重传就能成功，那接口最快响应也是 1 s 以后的事情了。这对接口耗时影响非常的大。
+
+<img src="三次握手中的客户端connect异常查找.assets/image-20230827094108285.png" alt="image-20230827094108285" style="zoom:50%;" />
+
+服务器在 connect 发出 syn 后就开启了重传定时器。
+
+```
+//file:net/ipv4/tcp_output.c
+int tcp_connect(struct sock *sk)
+{
+ ...
+ //实际发出 syn
+ err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
+       tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
+
+ //启动重传定时器
+ inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+      inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
+}
+```
+
+在定时器设置中传入的 inet_csk(sk)->icsk_rto 是超时时间，该值初始的时候被设置为了 1 秒。
+
+```
+//file:ipv4/tcp_output.c
+void tcp_connect_init(struct sock *sk)
+{
+ //初始化为 TCP_TIMEOUT_INIT 
+ inet_csk(sk)->icsk_rto = TCP_TIMEOUT_INIT;
+ ...
+}
+
+//file: include/net/tcp.h
+#define TCP_TIMEOUT_INIT ((unsigned)(1*HZ)) 
+```
+
+如果能正常接收到服务器响应的 synack，那么客户端的这个定时器会清除。这段逻辑在 tcp_rearm_rto 里。（tcp_rcv_state_process -> tcp_rcv_synsent_state_process -> tcp_ack -> tcp_clean_rtx_queue -> tcp_rearm_rto）
+
+```
+//file:net/ipv4/tcp_input.c
+void tcp_rearm_rto(struct sock *sk)
+{
+ inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);
+}
+```
+
+如果服务器端发生了丢包，那么定时器到时后会进行回调函数 tcp_write_timer 中进行重传。
+
+```
+//file: net/ipv4/tcp_timer.c
+static void tcp_write_timer(unsigned long data)
+{
+ tcp_write_timer_handler(sk);
+ ...
+}
+
+void tcp_write_timer_handler(struct sock *sk)
+{
+ //取出定时器类型。
+ event = icsk->icsk_pending;
+
+ switch (event) {
+ case ICSK_TIME_RETRANS:
+  icsk->icsk_pending = 0;
+  //重传
+  tcp_retransmit_timer(sk);
+  break;
+ ......
+ }
+}
+```
+
+tcp_retransmit_timer 是重传的主要函数。在这里完成重传，以及下一次定时器到期时间的设置。
+
+```
+//file: net/ipv4/tcp_timer.c
+void tcp_retransmit_timer(struct sock *sk)
+{
+ ...
+
+ //超过了重传次数则退出
+ if (tcp_write_timeout(sk))
+  goto out;
+
+ //重传
+ if (tcp_retransmit_skb(sk, tcp_write_queue_head(sk)) > 0) {
+  //重传失败
+  ......
+ }
+
+//退出前重新设置下一次超时时间
+out_reset_timer:
+ //计算超时时间
+ if (sk->sk_state == TCP_ESTABLISHED ){
+  ......
+ } else {
+  icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);
+ }
+
+ //设置
+ inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk->icsk_rto, TCP_RTO_MAX); 
+}
+```
+
+tcp_write_timeout 是判断是否重试过多，如果是则退出重试逻辑。
+
+### **第三次握手丢包**
+
+客户端在收到服务器的 synack 响应的时候，就认为连接建立成功了，然后会将自己的连接状态设置为 ESTABLISHED，发出第三次握手请求。但服务器在第三次握手的时候，还有可能会有意外发生。
+
+```
+//file: net/ipv4/tcp_ipv4.c
+struct sock *tcp_v4_syn_recv_sock(struct sock *sk, ...)
+{    
+    //判断接收队列是不是满了
+    if (sk_acceptq_is_full(sk))
+        goto exit_overflow;
+    ...
+exit_overflow:
+ NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+ ...
+}
+```
+
+从上述代码可以看出，**第三次握手时，如果服务器全连接队列满了，来自客户端的 ack 握手包又被直接丢弃了**。
+
+三次握手完的请求是要放在全连接队列里的。但是假如全连接队列满了，仍然三次握手也不会成功。
+
+**第三次握手失败并不是客户端重试，而是由客户端来重发 synack。**
+
+
+
+#### 三次握手中的端口的状态变化
+
+<img src="三次握手中的客户端connect异常查找.assets/image-20230802162205749.png" alt="image-20230802162205749" style="zoom:50%;" />
+
+正常的 TCP 三次握手过程：
+
+1、Client 端向 Server 端发送 SYN 发起握手，Client 端进入 SYN_SENT 状态
+
+2、Server 端收到 Client 端的 SYN 请求后，Server 端进入 SYN_RECV 状态，此时内核会**将连接存储到半连接队列(SYN Queue)**，并向 Client 端回复 SYN+ACK
+
+3、Client 端收到 Server 端的 SYN+ACK 后，Client 端回复 ACK 并进入 ESTABLISHED 状态
+
+4、Server 端收到 Client 端的 ACK 后，内核**将连接从半连接队列(SYN Queue)中取出，添加到全连接队列(Accept Queue)**，Server 端进入 ESTABLISHED 状态
+
+5、Server 端应用进程**调用 accept 函数时，将连接从全连接队列(Accept Queue)中取出**
+
+
+
+
+
+**什么是 TCP 半连接队列和全连接队列？**
+
+在 TCP 三次握手的时候，Linux 内核会维护两个队列，分别是：
+
+- 半连接队列，也称 SYN 队列；
+- 全连接队列，也称 accepet 队列；
+
+服务端收到客户端发起的 SYN 请求后，**内核会把该连接存储到半连接队列**，并向客户端响应 SYN+ACK，接着客户端会返回 ACK，服务端收到第三次握手的 ACK 后，**内核会把连接从半连接队列移除，然后创建新的完全的连接，并将其添加到 accept 队列，等待进程调用 accept 函数时把连接取出来。**
+
+<img src="三次握手中的客户端connect异常查找.assets/image-20230802162734597.png" alt="image-20230802162734597" style="zoom: 50%;" />
+
+不管是半连接队列还是全连接队列，都有最大长度限制，超过限制时，内核会直接丢弃，或返回 RST 包。
+
+**全连接队列最大长度控制**
+
+TCP 全连接队列的最大长度由 min(somaxconn, backlog) 控制，其中：
+
+- somaxconn 是 Linux 内核参数，由 /proc/sys/net/core/somaxconn 指定
+- backlog 是 TCP 协议中 listen 函数的参数之一，即 int listen(int sockfd, int backlog) 函数中的 backlog 大小。
+
+```
+/net/socket.c
+int __sys_listen(int fd, int backlog)
+{
+....
+
+	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+	if (sock) {
+		// /proc/sys/net/core/somaxconn
+		somaxconn = READ_ONCE(sock_net(sock->sk)->core.sysctl_somaxconn);
+		if ((unsigned int)backlog > somaxconn)
+			//// TCP 全连接队列最大长度 min(somaxconn, backlog)
+			backlog = somaxconn;
+
+		err = security_socket_listen(sock, backlog);
+		if (!err)
+			err = sock->ops->listen(sock, backlog);
+
+		fput_light(sock->file, fput_needed);
+	}
+	return err;
+}
+```
+
+##### **TCP 全连接队列溢出**
+
+可以使用 `ss` 命令，来查看 TCP 全连接队列的情况：
+
+但需要注意的是 `ss` 命令获取的 `Recv-Q/Send-Q` 在「LISTEN 状态」和「非 LISTEN 状态」所表达的含义是不同的。从下面的内核代码可以看出区别：
+
+```
+/net/ipv4/tcp_diag.c
+static void tcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
+			      void *_info)
+{
+	struct tcp_info *info = _info;
+	
+	//如果TCP连接的状态是LISTEN时
+	if (inet_sk_state_load(sk) == TCP_LISTEN) {
+		//当前全连接队列的大小
+		r->idiag_rqueue = READ_ONCE(sk->sk_ack_backlog);
+		//当前全链接最大队列的长度
+		r->idiag_wqueue = READ_ONCE(sk->sk_max_ack_backlog);
+		//如果TCP连接的状态不是LISTEN时
+	} else if (sk->sk_type == SOCK_STREAM) {
+		const struct tcp_sock *tp = tcp_sk(sk);
+		//已收到但未被应用程序进程读取的字节数
+		r->idiag_rqueue = max_t(int, READ_ONCE(tp->rcv_nxt) -
+					     READ_ONCE(tp->copied_seq), 0);
+		//已发送但未收到确认的字节数
+		r->idiag_wqueue = READ_ONCE(tp->write_seq) - tp->snd_una;
+	}
+	if (info)
+		tcp_get_info(sk, info);
+}
+```
+
+处于**LISTENING状态**，端口是开放的，等待被连接。
+
+![image-20230802193343891](三次握手中的客户端connect异常查找.assets/image-20230802193343891.png)
+
+```
+-l 显示正在监听的（listening）的socket
+-n 不显示服务名称
+-t 只显示tcp socket
+```
+
+- Recv-Q：当前全连接队列的大小，也就是当前已完成三次握手并等待服务端 `accept()` 的 TCP 连接；
+- Send-Q：当前全连接最大队列长度，上面的输出结果说明监听 22 端口的 TCP 服务，最大全连接长度为 128；
+
+在「非 LISTEN 状态」时，
+
+![image-20230802193722023](三次握手中的客户端connect异常查找.assets/image-20230802193722023.png)
+
+- Recv-Q：已收到但未被应用进程读取的字节数；
+- Send-Q：已发送但未收到确认的字节数；
+
+**当服务端并发处理大量请求时，如果 TCP 全连接队列过小，就容易溢出。发生 TCP 全连接队溢出的时候，后续的请求就会被丢弃，这样就会出现服务端请求数量上不去的现象。**
+
+<img src="三次握手中的客户端connect异常查找.assets/v2-59396b0f9eb18eca18fff60398558dc1_r.jpg" alt="img" style="zoom:67%;" />
+
+#### 如何增大 TCP 全连接队列呢？
+
+**TCP 全连接队列足最大值取决于 somaxconn 和 backlog 之间的最小值，也就是 min(somaxconn, backlog)**。从下面的 Linux 内核代码可以得知：
+
+```
+// Listen 函数调用的内核源码
+SYSCALL_DEFINE2(listen, int， fd, int, backlog)
+{
+	...
+	// /proc/sys/net/core/somaxconn
+	somaxconn = sock_net(sock->sk)->core.syscti_somaxconn;
+	
+	// TCP 全连接队列最大值 = min(somaxconn， backlog)
+	if ((unsigned)backlog > somaxconn)
+		backlog = somaxconn;
+		
+	...
+}
+```
+
+**如果持续不断地有连接因为 TCP 全连接队列溢出被丢弃，就应该调大 backlog 以及 somaxconn 参数。**
+
+
+
+##### TCP半队列溢出
+
+半连接队列的大小并不单单只跟 `tcp_max_syn_backlog` 有关系。
+
+三个条件因队列长度的关系而被丢弃的：
+
+<img src="三次握手中的客户端connect异常查找.assets/image-20230901175421478-1693562066386-1-1693562072850-3.png" alt="image-20230901175421478" style="zoom:50%;" />
+
+1. **如果半连接队列满了，并且没有开启 tcp_syncookies，则会丢弃；**
+2. **若全连接队列满了，且没有重传 SYN+ACK 包的连接请求多于 1 个，则会丢弃；**
+3. **如果没有开启 tcp_syncookies，并且 max_syn_backlog 减去 当前半连接队列长度小于 (max_syn_backlog >> 2)，则会丢弃；**
+
+检测半连接队列是否满的函数 inet_csk_reqsk_queue_is_full 和 检测全连接队列是否满的函数 sk_acceptq_is_full 
+
+```
+/include/net/inet_connection_sock.h
+static inline int inet_csk_reqsk_queue_is_full(const struct sock *sk)
+{
+	//检测半连接队列是否已满
+	return inet_csk_reqsk_queue_len(sk) >= sk->sk_max_ack_backlog;
+}
+```
+
+```
+/include/net/sock.h
+static inline bool sk_acceptq_is_full(const struct sock *sk)
+{	
+	//检测全连接队列是否已满	
+	return READ_ONCE(sk->sk_ack_backlog) > READ_ONCE(sk->sk_max_ack_backlog);
+}
+```
+
+
+
+
+
+查看本机的重发包次数
+
+```
+// 第一次握手重传次数限制
+cat /proc/sys/net/ipv4/tcp_syn_retries
+
+// 第二次握手重传次数限制
+cat /proc/sys/net/ipv4/tcp_synack_retries
+
+// 数据包最大重传次数限制
+cat /proc/sys/net/ipv4/tcp_retries2
+```
+
+![image-20230827115831971](三次握手中的客户端connect异常查找.assets/image-20230827115831971-1693108716887-1-1693108720744-3-1693108722124-5-1693108723735-7-1693108724760-9.png)
+
+观察本机的重发包过程
+
+![image-20230829121502575](三次握手中的客户端connect异常查找.assets/image-20230829121502575.png)
+
+
+
+
 
